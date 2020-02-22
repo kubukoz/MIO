@@ -38,11 +38,7 @@ object Exit {
   def fromEither[A](either: Either[Throwable, A]): Exit[A] = either.fold(Failed(_), Succeeded(_))
 }
 
-trait Fiber[+A] extends Serializable {
-  def join: IO[Exit[A]]
-  def cancel: IO[Unit]
-  def id: FiberId
-}
+final case class Fiber[+A](id: FiberId, join: IO[Exit[A]], cancel: IO[Unit])
 
 final case class FiberId(id: String)
 
@@ -175,11 +171,9 @@ object IO {
 
     val (fiberId, cancelFiber) = unsafeRunAsync(ioa)(promise.success)(runtime)
 
-    new Fiber[A] {
-      val join: IO[Exit[A]] = IO.fromFuture(IO.pure(promise.future))
-      val cancel: IO[Unit] = cancelFiber
-      val id: FiberId = fiberId
-    }
+    val join = IO.fromFuture(IO.pure(promise.future))
+
+    Fiber(fiberId, join, cancelFiber)
   }
 
   // //thread safe
