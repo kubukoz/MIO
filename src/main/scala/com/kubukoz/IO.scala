@@ -55,6 +55,8 @@ sealed trait IO[+A] extends Serializable {
     this.flatMap(a => restore(use(a)).exit.flatTap(cleanup(a, _)).flatMap(IO.fromExit))
   }
 
+  def continual[B](f: Either[Throwable, A] => IO[B]): IO[B] = IO.mask(_(attempt).flatMap(f))
+
   def uncancelable: IO[A] = bracket(_.pure[IO])(_ => IO.unit)
 }
 
