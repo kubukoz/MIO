@@ -17,7 +17,6 @@ import cats.implicits._
 import scala.util.Random
 import java.util.concurrent.atomic.AtomicBoolean
 import cats.~>
-import cats.effect.Sync
 import cats.effect.ExitCase
 import cats.effect.Resource
 
@@ -146,7 +145,7 @@ object IO {
       }
     }
 
-  implicit val ioSync: Sync[IO] = new Sync[IO] with StackSafeMonad[IO] {
+  implicit val ioAsync: cats.effect.Async[IO] = new cats.effect.Async[IO] with StackSafeMonad[IO] {
     def pure[A](x: A): IO[A] = IO.pure(x)
     def raiseError[A](e: Throwable): IO[A] = IO.raiseError(e)
     def handleErrorWith[A](fa: IO[A])(f: Throwable => IO[A]): IO[A] = fa.attempt.flatMap(_.fold(f, pure))
@@ -163,6 +162,8 @@ object IO {
       }
 
     def suspend[A](thunk: => IO[A]): IO[A] = IO.suspend(thunk)
+    def async[A](k: (Either[Throwable, A] => Unit) => Unit): IO[A] = asyncF { cb => k(cb); unit }
+    def asyncF[A](k: (Either[Throwable, A] => Unit) => IO[Unit]): IO[A] = IO.async(k)
   }
 
   private val globalFiberId = new AtomicLong(0)
