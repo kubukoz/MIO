@@ -26,13 +26,14 @@ val compilerPlugins = List(
 )
 
 val commonSettings = Seq(
-  scalaVersion := Scala212,
+  scalaVersion := Scala213,
   crossScalaVersions := List(Scala212, Scala213),
   scalacOptions --= Seq("-Xfatal-warnings"),
   name := "catharsis",
   updateOptions := updateOptions.value.withGigahorse(false),
   testFrameworks += new TestFramework("munit.Framework"),
   libraryDependencies ++= List(
+    "org.typelevel" %% "cats-core" % "2.1.0",
     "org.scalameta" %% "munit" % "0.5.2" % Test
   ) ++ compilerPlugins
 )

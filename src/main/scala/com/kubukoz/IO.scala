@@ -10,6 +10,12 @@ import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import scala.util.control.NonFatal
+import scala.concurrent.Promise
+import scala.concurrent.Future
+import cats.MonadError
+import cats.StackSafeMonad
+import cats.implicits._
+import scala.util.Random
 
 sealed trait Exit[+A] extends Product with Serializable
 
@@ -33,6 +39,9 @@ sealed trait IO[+A] extends Serializable {
 
   def continual[B](f: Either[Throwable, A] => IO[B]): IO[B] = IO.FlatMap(this.attempt, f, cancelable = false)
   def map[B](f: A => B): IO[B] = flatMap(f.andThen(IO.pure))
+  def as[B](b: => B): IO[B] = map(_ => b)
+  def void: IO[Unit] = this *> IO.unit
+
   def attempt: IO[Either[Throwable, A]] = IO.Attempt(this)
 
   def *>[B](iob: IO[B]): IO[B] = flatMap(_ => iob)
@@ -59,6 +68,7 @@ object IO {
 
   def apply[A](a: => A): IO[A] = delay(a)
 
+  val unit: IO[Unit] = IO.pure(())
   def pure[A](a: A): IO[A] = Pure(a)
   def delay[A](a: => A): IO[A] = Delay(() => a)
   def suspend[A](a: => IO[A]): IO[A] = delay(a).flatten
@@ -66,12 +76,23 @@ object IO {
   def fromEither[A](ea: Either[Throwable, A]): IO[A] = ea.fold(raiseError, pure)
 
   def async[A](cb: (Either[Throwable, A] => Unit) => Unit): IO[A] = Async(cb)
+  val never: IO[Nothing] = async(_ => ())
+
+  def fromFuture[A](futurea: IO[Future[A]]): IO[A] = futurea.flatMap { future =>
+    future.value match {
+      case None    => IO.async(cb => future.onComplete(cb.compose(_.toEither))(ExecutionContext.parasitic))
+      case Some(t) => fromEither(t.toEither)
+    }
+  }
+
   def blocking[A](ioa: IO[A]): IO[A] = IO.Blocker.flatMap(ioa.evalOn(_))
 
   val scheduler: IO[ScheduledExecutorService] = IO.Scheduler
   val executor: IO[ExecutionContext] = IO.Executor
 
   val fiberId: IO[FiberId] = IO.Identifier
+
+  val flipCoin: IO[Boolean] = IO(Random.nextBoolean())
 
   def sleep(units: Long, unit: TimeUnit): IO[Unit] =
     IO.scheduler.flatMap { ses =>
@@ -82,9 +103,32 @@ object IO {
       }
     }
 
-  private val globalFiberId = new AtomicLong(0)
+  implicit val ioMonad: MonadError[IO, Throwable] = new StackSafeMonad[IO] with MonadError[IO, Throwable] {
+    def flatMap[A, B](fa: IO[A])(f: A => IO[B]): IO[B] = fa.flatMap(f)
+    def pure[A](x: A): IO[A] = IO.pure(x)
+    def raiseError[A](e: Throwable): IO[A] = IO.raiseError(e)
+    def handleErrorWith[A](fa: IO[A])(f: Throwable => IO[A]): IO[A] = fa.attempt.flatMap(_.fold(f, pure))
+  }
 
-  def unsafeRunAsync[A](ioa: IO[A])(cb: Either[Throwable, A] => Unit)(runtime: Runtime): Unit = {
+  private val globalFiberId = new AtomicLong(0)
+  private def newFiberId() = FiberId("Fiber-" + globalFiberId.getAndIncrement())
+
+  def unsafeRun[A](ioa: IO[A])(runtime: Runtime): Fiber[A] = {
+    val promise = Promise[Exit[A]]()
+
+    val fiberId = unsafeRunAsync(ioa) {
+      case Left(e)  => promise.success(Exit.Failed(e))
+      case Right(a) => promise.success(Exit.Succeeded(a))
+    }(runtime)
+
+    new Fiber[A] {
+      def join: IO[Exit[A]] = IO.fromFuture(IO.pure(promise.future))
+      def cancel: IO[Unit] = IO.raiseError(new Throwable("cancel isn't implemented yet"))
+      def id: FiberId = fiberId
+    }
+  }
+
+  def unsafeRunAsync[A](ioa: IO[A])(cb: Either[Throwable, A] => Unit)(runtime: Runtime): FiberId = {
     def doRun[B](iob: IO[B])(cb: Either[Throwable, B] => Unit)(ctx: Context): Unit = {
       def continue(value: B) = cb(Right(value))
 
@@ -104,8 +148,12 @@ object IO {
         case Scheduler   => continue(runtime.scheduler)
         case Attempt(io) => doRun(io)(continue)(ctx)
 
-        case Fork(_)  => cb(Left(new Throwable("fork isn't supported yet")))
-        case Async(f) => f(asyncResult => ctx.ec.execute(() => cb(asyncResult)))
+        case Fork(self) => cb(Right(unsafeRun(self)(runtime)))
+        case Async(f) =>
+          f { asyncResult =>
+            //todo this must check for an idempotency flag
+            ctx.ec.execute(() => cb(asyncResult))
+          }
         case On(ec, io) =>
           ec.execute(() => doRun(io)(result => ctx.ec.execute(() => cb(result)))(ctx.withExecutor(ec)))
         case next: FlatMap[a, b] =>
@@ -117,10 +165,10 @@ object IO {
       }
     }
 
-    def newFiberId() = FiberId("Fiber-" + globalFiberId.getAndIncrement())
     val rootContext = Context(runtime.ec, newFiberId())
 
     runtime.ec.execute(() => doRun(ioa)(cb)(rootContext))
+    rootContext.id
   }
 
   def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): Either[Throwable, A] = {
@@ -173,8 +221,12 @@ object IODemo extends App {
       _ <- printThread("bar")
       _ <- IO.fiberId.flatMap(putStrLn)
       _ <- printThread("before sleep")
-      _ <- IO.sleep(500L, TimeUnit.MILLISECONDS)
-      _ <- printThread("after sleep")
+
+      prog = IO.sleep(500L, TimeUnit.MILLISECONDS) *> IO.fiberId.flatMap(putStrLn) *> IO
+        .flipCoin
+        .ifM(IO.pure(42), IO.raiseError(new Throwable("failed coin flip :/")))
+      _ <- List.fill(10)(prog).traverse(_.fork).flatMap(_.traverse(_.join)).flatMap(putStrLn(_))
+      _ <- printThread("after sleeps")
     } yield 42
 
   println {
