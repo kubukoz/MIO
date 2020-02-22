@@ -68,6 +68,7 @@ object IO {
   final private case class Attempt[A](self: IO[A]) extends IO[Either[Throwable, A]]
   final private case class Delay[A](f: () => A) extends IO[A]
   final private case class Fork[A](self: IO[A]) extends IO[Fiber[A]]
+  final private case object Yield extends IO[Unit]
   final private case class Async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]) extends IO[A]
   final private case class On[A](ec: ExecutionContext, underlying: IO[A]) extends IO[A]
   final private case class FlatMap[A, B](ioa: IO[A], f: A => IO[B]) extends IO[B]
@@ -112,6 +113,7 @@ object IO {
   def askCancelability[A](f: Boolean => IO[A]): IO[A] = AskCancelability(f)
   def async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]): IO[A] = Async(cb)
   val never: IO[Nothing] = async(_ => IO.unit)
+  val cede: IO[Unit] = Yield
 
   def fromFuture[A](futurea: IO[Future[A]]): IO[A] = futurea.flatMap { future =>
     future.value match {
@@ -202,8 +204,8 @@ object IO {
         case Pure(a)       => continue(a)
         case Canceled      => cb(Exit.Canceled)
         case RaiseError(e) => cb(Exit.Failed(e))
-
         case ex: ExitOf[a] => doRun(ex.ioa)(continue)(ctx)
+
         //sync FFI
         case Delay(f) =>
           try continue(f())
@@ -223,6 +225,9 @@ object IO {
 
         case WithCancelability(block, newCancelable) => doRun(block)(cb)(ctx.withCancelability(newCancelable))
         case AskCancelability(ask)                   => doRun(ask(ctx.cancelable))(cb)(ctx)
+
+        case Yield => ctx.ec.execute(() => continue(()))
+
         case Fork(self) =>
           val child = unsafeRun(self)(runtime)
 
@@ -328,16 +333,18 @@ trait IOApp {
       try {
         val (awaitExit, finalizers) = IO.unsafeRunSync(run(args.toList))(runtime)
 
-        val hook = new Thread(() => {
-          val _ = IO.unsafeRunSync(finalizers)(runtime)
-          // val _ = run //scalafmt couldn't parse this
-          ()
-        })
+        // val hook = new Thread(() => {
+        //   val _ = IO.unsafeRunSync(finalizers)(runtime)
+        //   // val _ = run //scalafmt couldn't parse this
+        //   ()
+        // })
 
-        Runtime.getRuntime().addShutdownHook(hook)
+        // Runtime.getRuntime().addShutdownHook(hook)
 
-        //probably not the best way to do it, but...
-        awaitExit().fold(a => { Runtime.getRuntime().removeShutdownHook(hook); a }, reportError, 0)
+        // //probably not the best way to do it, but...
+        // awaitExit().fold(a => { Runtime.getRuntime().removeShutdownHook(hook); a }, reportError, 0)
+        awaitExit()
+        0
       } finally {
         try scheduler.shutdown()
         finally blocker.shutdown()
@@ -371,19 +378,20 @@ object IODemo extends IOApp {
       _ <- printFiber("prog")
       _ <- printThread("before sleep")
 
-      prog = IO.sleep(500L, TimeUnit.MILLISECONDS) *> IO.fiberId.flatMap(putStrLn) *> IO
-        .flipCoin
-        .ifM(IO.fiberId, IO.raiseError(new Throwable("failed coin flip :/")))
+      prog = IO.sleep(500L, TimeUnit.MILLISECONDS) *>
+        IO.fiberId.flatMap(putStrLn) *>
+        IO.flipCoin.ifM(IO.fiberId, IO.raiseError(new Throwable("failed coin flip :/")))
       _ <- List.fill(5)(prog).traverse(_.fork).flatMap(_.traverse(_.join)).flatMap(putStrLn(_))
       _ <- printThread("after sleeps")
     } yield 42
 
-  def run(args: List[String]): IO[Int] = newEcResource.use { newEc =>
-    printThread("before evalOn") *> prog.evalOn(newEc) <* printThread("after evalOn")
-  }
-  // (putStrLn("Starting") *> IO.sleep(2, TimeUnit.SECONDS) *> putStrLn("completed!"))
-  //   .fork
-  //   .flatMap(fib => IO.sleep(500, TimeUnit.MILLISECONDS) *> fib.cancel *> fib.join.flatMap(putStrLn(_)))
-  //   .as(0)
+  def run(args: List[String]): IO[Int] =
+    (putStrLn("Starting") *> IO.sleep(2, TimeUnit.SECONDS) *> putStrLn("completed!"))
+      .fork
+      .flatMap(fib => IO.sleep(500, TimeUnit.MILLISECONDS) *> fib.cancel *> fib.join.flatMap(putStrLn(_)))
+      .as(0)
 
+  /* newEcResource.use { newEc =>
+    printThread("before evalOn") *> prog.evalOn(newEc) <* printThread("after evalOn")
+  } */
 }
