@@ -12,11 +12,14 @@ import java.util.concurrent.atomic.AtomicLong
 import scala.util.control.NonFatal
 import scala.concurrent.Promise
 import scala.concurrent.Future
-import cats.MonadError
 import cats.StackSafeMonad
 import cats.implicits._
 import scala.util.Random
 import java.util.concurrent.atomic.AtomicBoolean
+import cats.~>
+import cats.effect.Sync
+import cats.effect.ExitCase
+import cats.effect.Resource
 
 sealed trait Exit[+A] extends Product with Serializable {
 
@@ -45,36 +48,39 @@ final case class FiberId(id: String)
 
 sealed trait IO[+A] extends Serializable {
   def flatMap[B](f: A => IO[B]): IO[B] = IO.FlatMap(this, f)
-  def flatten[B](implicit ev: A <:< IO[B]): IO[B] = flatMap(ev)
-
-  def map[B](f: A => B): IO[B] = flatMap(f.andThen(IO.pure))
-  def as[B](b: => B): IO[B] = map(_ => b)
-  def void: IO[Unit] = this *> IO.unit
-
   def attempt: IO[Either[Throwable, A]] = IO.Attempt(this)
-
-  def *>[B](iob: IO[B]): IO[B] = flatMap(_ => iob)
-  def <*[B](iob: IO[B]): IO[A] = flatMap(a => iob *> IO.pure(a))
-
   def evalOn(ec: ExecutionContext): IO[A] = IO.On(ec, this)
-
   def fork: IO[Fiber[A]] = IO.Fork(this)
+  def exit: IO[Exit[A]] = IO.ExitOf(this)
+
+  def bracket[B](use: A => IO[B])(cleanup: A => IO[Unit]): IO[B] = bracketExit(use)((a, _) => cleanup(a))
+
+  def bracketExit[B](use: A => IO[B])(cleanup: (A, Exit[B]) => IO[Unit]): IO[B] = IO.mask { restore =>
+    this.flatMap(a => restore(use(a)).exit.flatTap(cleanup(a, _)).flatMap(IO.fromExit))
+  }
+
+  def uncancelable: IO[A] = bracket(_.pure[IO])(_ => IO.unit)
 }
 
 object IO {
-  final case class Pure[A](a: A) extends IO[A]
-  final case class RaiseError(e: Throwable) extends IO[Nothing]
-  final case class Attempt[A](self: IO[A]) extends IO[Either[Throwable, A]]
-  final case class Delay[A](f: () => A) extends IO[A]
-  final case class Fork[A](self: IO[A]) extends IO[Fiber[A]]
-  final case class Async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]) extends IO[A]
-  final case class On[A](ec: ExecutionContext, underlying: IO[A]) extends IO[A]
-  final case class FlatMap[A, B](ioa: IO[A], f: A => IO[B]) extends IO[B]
-  final case object Canceled extends IO[Nothing]
-  final case object Blocker extends IO[ExecutionContext]
-  final case object Executor extends IO[ExecutionContext]
-  final case object Scheduler extends IO[ScheduledExecutorService]
-  final case object Identifier extends IO[FiberId]
+  final private case class Pure[A](a: A) extends IO[A]
+  final private case class RaiseError(e: Throwable) extends IO[Nothing]
+  final private case class Attempt[A](self: IO[A]) extends IO[Either[Throwable, A]]
+  final private case class Delay[A](f: () => A) extends IO[A]
+  final private case class Fork[A](self: IO[A]) extends IO[Fiber[A]]
+  final private case class Async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]) extends IO[A]
+  final private case class On[A](ec: ExecutionContext, underlying: IO[A]) extends IO[A]
+  final private case class FlatMap[A, B](ioa: IO[A], f: A => IO[B]) extends IO[B]
+  final private case class AskCancelability[A](ioa: Boolean => IO[A]) extends IO[A]
+  final private case class WithCancelability[A](ioa: IO[A], isCancelable: Boolean) extends IO[A]
+  final private case class ExitOf[A](ioa: IO[A]) extends IO[Exit[A]]
+  final private case object Canceled extends IO[Nothing]
+  //runtime
+  final private case object Blocker extends IO[ExecutionContext]
+  final private case object Scheduler extends IO[ScheduledExecutorService]
+  //context
+  final private case object Executor extends IO[ExecutionContext]
+  final private case object Identifier extends IO[FiberId]
 
   def apply[A](a: => A): IO[A] = delay(a)
 
@@ -87,13 +93,30 @@ object IO {
   def fromEither[A](ea: Either[Throwable, A]): IO[A] = ea.fold(raiseError, pure)
   def fromExit[A](exit: Exit[A]): IO[A] = exit.fold(pure, raiseError, canceled)
 
+  type Restore = IO ~> IO
+
+  //Uncancelable block, with cancelability of the enclosing block restored in the blocks wrapped with `Restore`.
+  def mask[A](use: Restore => IO[A]): IO[A] = mask(use, false)
+
+  //Cancelable block, with blocks surrounded by restore(...) inheriting cancelability of enclosing block.
+  def maskCancelable[A](use: Restore => IO[A]): IO[A] = mask(use, true)
+
+  //A block with cancelatility set by default to the given flag.
+  def mask[A](use: Restore => IO[A], default: Boolean): IO[A] = askCancelability { inherited =>
+    val restore: Restore = λ[IO ~> IO](WithCancelability(_, inherited))
+
+    WithCancelability(use(restore), default)
+  }
+
+  //Provide the curent cancelability status to a block. There's no cancelation possible between checking the status and starting the action in `f`.
+  def askCancelability[A](f: Boolean => IO[A]): IO[A] = AskCancelability(f)
   def async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]): IO[A] = Async(cb)
   val never: IO[Nothing] = async(_ => IO.unit)
 
   def fromFuture[A](futurea: IO[Future[A]]): IO[A] = futurea.flatMap { future =>
     future.value match {
       case None =>
-        IO.async { cb =>
+        IO.async[A] { cb =>
           future.onComplete(cb.compose(_.toEither))(ExecutionContext.parasitic)
           IO.unit
         }
@@ -116,15 +139,30 @@ object IO {
         val scheduling = ses.schedule((() => cb(Right(()))): Runnable, units, unit)
 
         //todo should it be false?
-        IO(scheduling.cancel(false)).void
+        IO(println("exiting sleep")) *>
+          IO(scheduling.cancel(false)) *>
+          IO.sleep(1, TimeUnit.SECONDS) *>
+          IO(println("exited sleep"))
       }
     }
 
-  implicit val ioMonad: MonadError[IO, Throwable] = new StackSafeMonad[IO] with MonadError[IO, Throwable] {
-    def flatMap[A, B](fa: IO[A])(f: A => IO[B]): IO[B] = fa.flatMap(f)
+  implicit val ioSync: Sync[IO] = new Sync[IO] with StackSafeMonad[IO] {
     def pure[A](x: A): IO[A] = IO.pure(x)
     def raiseError[A](e: Throwable): IO[A] = IO.raiseError(e)
     def handleErrorWith[A](fa: IO[A])(f: Throwable => IO[A]): IO[A] = fa.attempt.flatMap(_.fold(f, pure))
+    def flatMap[A, B](fa: IO[A])(f: A => IO[B]): IO[B] = fa.flatMap(f)
+
+    def bracketCase[A, B](acquire: IO[A])(use: A => IO[B])(release: (A, ExitCase[Throwable]) => IO[Unit]): IO[B] =
+      acquire.bracketExit(use) { (a, exit) =>
+        val exitCase = exit match {
+          case Exit.Canceled     => ExitCase.Canceled
+          case Exit.Failed(e)    => ExitCase.Error(e)
+          case Exit.Succeeded(_) => ExitCase.Completed
+        }
+        release(a, exitCase)
+      }
+
+    def suspend[A](thunk: => IO[A]): IO[A] = IO.suspend(thunk)
   }
 
   private val globalFiberId = new AtomicLong(0)
@@ -142,8 +180,19 @@ object IO {
     }
   }
 
+  // //thread safe
+  // private class FinalizerStack(var stack: AtomicReference[List[IO[Unit]]]) {
+
+  //   def push(finalizer: IO[Unit]): Unit = { val _ = stack.updateAndGet(finalizer :: _) }
+
+  //   def popAll(): List[IO[Unit]] = stack.getAndSet(Nil).reverse
+  // }
+
   def unsafeRunAsync[A](ioa: IO[A])(cb: Exit[A] => Unit)(runtime: Runtime): (FiberId, IO[Unit]) = {
-    val canceled = new AtomicBoolean(false)
+    // val canceled = new AtomicBoolean(false)
+
+    //must be thread safe
+    // val finalizers: FinalizerStack = new FinalizerStack(new AtomicReference(Nil))
 
     def doRun[B](iob: IO[B])(cb: Exit[B] => Unit)(ctx: Context): Unit = {
       def continue(value: B) = cb(Exit.Succeeded(value))
@@ -154,6 +203,7 @@ object IO {
         case Canceled      => cb(Exit.Canceled)
         case RaiseError(e) => cb(Exit.Failed(e))
 
+        case ex: ExitOf[a] => doRun(ex.ioa)(continue)(ctx)
         //sync FFI
         case Delay(f) =>
           try continue(f())
@@ -168,19 +218,41 @@ object IO {
           doRun(a.self) {
             case Exit.Succeeded(r) => continue(Right(r))
             case Exit.Failed(e)    => continue(Left(e))
-            case Exit.Canceled     => throw new Exception("cancelation isn't supported yet")
+            case Exit.Canceled     => cb(Exit.Canceled)
           }(ctx)
 
-        case Fork(self) => cb(Exit.Succeeded(unsafeRun(self)(runtime)))
+        case WithCancelability(block, newCancelable) => doRun(block)(cb)(ctx.withCancelability(newCancelable))
+        case AskCancelability(ask)                   => doRun(ask(ctx.cancelable))(cb)(ctx)
+        case Fork(self) =>
+          val child = unsafeRun(self)(runtime)
+
+          //todo: non-daemonic children?
+
+          cb(Exit.Succeeded(child))
+
         case Async(f) =>
+          val callbackCalled = new AtomicBoolean(false)
+
           val finalizer = f { asyncResult =>
-            //todo this must check for an idempotency flag
-            ctx.ec.execute(() => cb(Exit.fromEither(asyncResult)))
+            //checking idempotency flag - if this is already true, don't do anything
+            if (!callbackCalled.getAndSet(true)) {
+              ctx.ec.execute { () =>
+                // if (!canceled.get())(
+                cb(Exit.fromEither(asyncResult))
+                // )
+              }
+            }
           }
-
-          //todo this should be handled on cancel
           val _ = finalizer
-
+        /*
+          //if the callback has been called already, cancel must no-op
+          finalizers.push {
+            IO(callbackCalled.get()).flatMap {
+              case true  => IO.unit
+              case false => finalizer *> IO(cb(Exit.Canceled))
+            }
+          }
+         */
         case On(ec, io) =>
           ec.execute(() => doRun(io)(result => ctx.ec.execute(() => cb(result)))(ctx.withExecutor(ec)))
 
@@ -189,18 +261,18 @@ object IO {
           doRun(next.ioa) {
             case Exit.Succeeded(v)  => doRun(next.f(v))(cb)(ctx)
             case e @ Exit.Failed(_) => cb(e)
-            case Exit.Canceled      => throw new Exception("cancelation isn't supported yet")
+            case Exit.Canceled      => cb(Exit.Canceled)
           }(ctx)
 
       }
     }
 
-    val rootContext = Context(runtime.ec, newFiberId())
+    val rootContext = Context(runtime.ec, newFiberId(), cancelable = true)
 
     runtime.ec.execute(() => doRun(ioa)(cb)(rootContext))
 
-    /* todo the second IO must wait for finalizers to finish */
-    (rootContext.id, IO(canceled.set(true)))
+    //cancel is no-op for now
+    (rootContext.id, IO.unit)
   }
 
   //returns: synchronous join, IO with finalizers
@@ -223,8 +295,9 @@ object IO {
 
   final case class Runtime(ec: ExecutionContext, scheduler: ScheduledExecutorService, blocker: ExecutionContext)
 
-  final private case class Context(ec: ExecutionContext, id: FiberId) {
+  final private case class Context(ec: ExecutionContext, id: FiberId, cancelable: Boolean) {
     def withExecutor(ec: ExecutionContext) = copy(ec = ec)
+    def withCancelability(cancelable: Boolean) = copy(cancelable = cancelable)
   }
 }
 
@@ -245,7 +318,6 @@ trait IOApp {
   //////////////
   def run(args: List[String]): IO[Int]
 
-  //todo install shutdown hooks etc
   def main(args: Array[String]): Unit = {
     def reportError(e: Throwable) = {
       new Throwable("IOApp#run failed", e).printStackTrace()
@@ -256,14 +328,19 @@ trait IOApp {
       try {
         val (awaitExit, finalizers) = IO.unsafeRunSync(run(args.toList))(runtime)
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() => {
+        val hook = new Thread(() => {
           val _ = IO.unsafeRunSync(finalizers)(runtime)
-        }))
+          // val _ = run //scalafmt couldn't parse this
+          ()
+        })
 
-        awaitExit().fold(identity, reportError, 0)
+        Runtime.getRuntime().addShutdownHook(hook)
+
+        //probably not the best way to do it, but...
+        awaitExit().fold(a => { Runtime.getRuntime().removeShutdownHook(hook); a }, reportError, 0)
       } finally {
-        scheduler.shutdown()
-        blocker.shutdown()
+        try scheduler.shutdown()
+        finally blocker.shutdown()
       }
 
     System.exit(code)
@@ -272,11 +349,15 @@ trait IOApp {
 
 object IODemo extends IOApp {
 
-  val newEc = ExecutionContext.fromExecutorService(Executors.newSingleThreadExecutor(unsafePrefixFactory("newEc")))
+  val newEcResource =
+    Resource.make(
+      IO(ExecutionContext.fromExecutorService(Executors.newSingleThreadExecutor(unsafePrefixFactory("newEc"))))
+    )(e => IO(e.shutdown()).void)
 
   def putStrLn(s: Any): IO[Unit] = IO(println(s))
 
   def printThread(tag: String) = IO.suspend(putStrLn(tag + ": " + Thread.currentThread().getName()))
+  def printFiber(tag: String) = IO.fiberId.flatMap(id => putStrLn(tag + ": " + id))
 
   val prog =
     for {
@@ -287,21 +368,22 @@ object IODemo extends IOApp {
             )
           )
       _ <- printThread("bar")
-      _ <- IO.fiberId.flatMap(putStrLn)
+      _ <- printFiber("prog")
       _ <- printThread("before sleep")
 
       prog = IO.sleep(500L, TimeUnit.MILLISECONDS) *> IO.fiberId.flatMap(putStrLn) *> IO
         .flipCoin
         .ifM(IO.fiberId, IO.raiseError(new Throwable("failed coin flip :/")))
-      _ <- List.fill(10)(prog).traverse(_.fork).flatMap(_.traverse(_.join)).flatMap(putStrLn(_))
+      _ <- List.fill(5)(prog).traverse(_.fork).flatMap(_.traverse(_.join)).flatMap(putStrLn(_))
       _ <- printThread("after sleeps")
     } yield 42
 
-  def run(args: List[String]): IO[Int] = {
+  def run(args: List[String]): IO[Int] = newEcResource.use { newEc =>
     printThread("before evalOn") *> prog.evalOn(newEc) <* printThread("after evalOn")
-  } <*
-    //this should be in `guarantee`, or better, in a Resource
-    //but we don't have bracket yet ;)
-    IO(newEc.shutdown())
+  }
+  // (putStrLn("Starting") *> IO.sleep(2, TimeUnit.SECONDS) *> putStrLn("completed!"))
+  //   .fork
+  //   .flatMap(fib => IO.sleep(500, TimeUnit.MILLISECONDS) *> fib.cancel *> fib.join.flatMap(putStrLn(_)))
+  //   .as(0)
 
 }

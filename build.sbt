@@ -33,10 +33,10 @@ val commonSettings = Seq(
   updateOptions := updateOptions.value.withGigahorse(false),
   testFrameworks += new TestFramework("munit.Framework"),
   libraryDependencies ++= List(
-    "org.typelevel" %% "cats-core" % "2.1.0",
+    "org.typelevel" %% "cats-effect" % "2.1.1", //just for the instances and Resource
     "org.scalameta" %% "munit" % "0.5.2" % Test
   ) ++ compilerPlugins
 )
 
-val myio =
+val mio =
   project.in(file(".")).settings(commonSettings)
