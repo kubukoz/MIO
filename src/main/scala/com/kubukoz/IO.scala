@@ -203,6 +203,7 @@ object IO {
     (rootContext.id, IO(canceled.set(true)))
   }
 
+  //returns: synchronous join, IO with finalizers
   def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): (() => Exit[A], IO[Unit]) = {
     val latch = new CountDownLatch(1)
     var value: Option[Exit[A]] = None

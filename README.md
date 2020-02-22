@@ -1,3 +1,3 @@
-# my-io
+# MIO
 
 Playground implementation of an IO monad.
