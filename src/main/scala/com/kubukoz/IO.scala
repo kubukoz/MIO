@@ -43,12 +43,9 @@ trait Fiber[+A] extends Serializable {
 final case class FiberId(id: String)
 
 sealed trait IO[+A] extends Serializable {
-  def flatMap[B](f: A => IO[B]): IO[B] = IO.FlatMap(this, f, continual = false)
+  def flatMap[B](f: A => IO[B]): IO[B] = IO.FlatMap(this, f)
   def flatten[B](implicit ev: A <:< IO[B]): IO[B] = flatMap(ev)
 
-  def continual[B](
-    f: Either[Throwable, A] => IO[B]
-  ): IO[B] = /* todo implement with mask */ IO.FlatMap(this.attempt, f, continual = true)
   def map[B](f: A => B): IO[B] = flatMap(f.andThen(IO.pure))
   def as[B](b: => B): IO[B] = map(_ => b)
   def void: IO[Unit] = this *> IO.unit
@@ -69,9 +66,9 @@ object IO {
   final case class Attempt[A](self: IO[A]) extends IO[Either[Throwable, A]]
   final case class Delay[A](f: () => A) extends IO[A]
   final case class Fork[A](self: IO[A]) extends IO[Fiber[A]]
-  final case class Async[A](cb: (Either[Throwable, A] => Unit) => Unit) extends IO[A]
+  final case class Async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]) extends IO[A]
   final case class On[A](ec: ExecutionContext, underlying: IO[A]) extends IO[A]
-  final case class FlatMap[A, B](ioa: IO[A], f: A => IO[B], continual: Boolean) extends IO[B]
+  final case class FlatMap[A, B](ioa: IO[A], f: A => IO[B]) extends IO[B]
   final case object Canceled extends IO[Nothing]
   final case object Blocker extends IO[ExecutionContext]
   final case object Executor extends IO[ExecutionContext]
@@ -89,12 +86,16 @@ object IO {
   def fromEither[A](ea: Either[Throwable, A]): IO[A] = ea.fold(raiseError, pure)
   def fromExit[A](exit: Exit[A]): IO[A] = exit.fold(pure, raiseError, canceled)
 
-  def async[A](cb: (Either[Throwable, A] => Unit) => Unit): IO[A] = Async(cb)
-  val never: IO[Nothing] = async(_ => ())
+  def async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]): IO[A] = Async(cb)
+  val never: IO[Nothing] = async(_ => IO.unit)
 
   def fromFuture[A](futurea: IO[Future[A]]): IO[A] = futurea.flatMap { future =>
     future.value match {
-      case None    => IO.async(cb => future.onComplete(cb.compose(_.toEither))(ExecutionContext.parasitic))
+      case None =>
+        IO.async { cb =>
+          future.onComplete(cb.compose(_.toEither))(ExecutionContext.parasitic)
+          IO.unit
+        }
       case Some(t) => fromEither(t.toEither)
     }
   }
@@ -111,9 +112,10 @@ object IO {
   def sleep(units: Long, unit: TimeUnit): IO[Unit] =
     IO.scheduler.flatMap { ses =>
       IO.async[Unit] { cb =>
-        //comment for formatting
-        //todo cancelable
-        val _ = ses.schedule((() => cb(Right(()))): Runnable, units, unit)
+        val scheduling = ses.schedule((() => cb(Right(()))): Runnable, units, unit)
+
+        //todo should it be false?
+        IO(scheduling.cancel(false)).void
       }
     }
 
@@ -168,12 +170,17 @@ object IO {
 
         case Fork(self) => cb(Exit.Succeeded(unsafeRun(self)(runtime)))
         case Async(f) =>
-          f { asyncResult =>
+          val finalizer = f { asyncResult =>
             //todo this must check for an idempotency flag
             ctx.ec.execute(() => cb(Exit.fromEither(asyncResult)))
           }
+
+          //todo this should be handled on cancel
+          val _ = finalizer
+
         case On(ec, io) =>
           ec.execute(() => doRun(io)(result => ctx.ec.execute(() => cb(result)))(ctx.withExecutor(ec)))
+
         case next: FlatMap[a, b] =>
           //stack safety? lmaooo
           doRun(next.ioa) {
