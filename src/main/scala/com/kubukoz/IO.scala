@@ -274,7 +274,8 @@ object IO {
 
     val rootContext = Context(runtime.ec, newFiberId(), cancelable = true)
 
-    runtime.ec.execute(() => doRun(ioa)(cb)(rootContext))
+    //Always yield before starting
+    doRun(IO.cede *> ioa)(cb)(rootContext)
 
     //cancel is no-op for now
     (rootContext.id, IO.unit)
