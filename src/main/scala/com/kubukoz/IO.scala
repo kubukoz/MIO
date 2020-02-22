@@ -17,12 +17,21 @@ import cats.StackSafeMonad
 import cats.implicits._
 import scala.util.Random
 
-sealed trait Exit[+A] extends Product with Serializable
+sealed trait Exit[+A] extends Product with Serializable {
+
+  def fold[B](succeeded: A => B, failed: Throwable => B, canceled: B): B = this match {
+    case Exit.Succeeded(a) => succeeded(a)
+    case Exit.Failed(e)    => failed(e)
+    case Exit.Canceled     => canceled
+  }
+}
 
 object Exit {
   final case class Succeeded[A](a: A) extends Exit[A]
   final case class Failed(e: Throwable) extends Exit[Nothing]
   final case object Canceled extends Exit[Nothing]
+
+  def fromEither[A](either: Either[Throwable, A]): Exit[A] = either.fold(Failed(_), Succeeded(_))
 }
 
 trait Fiber[+A] extends Serializable {
@@ -34,10 +43,12 @@ trait Fiber[+A] extends Serializable {
 final case class FiberId(id: String)
 
 sealed trait IO[+A] extends Serializable {
-  def flatMap[B](f: A => IO[B]): IO[B] = IO.FlatMap(this, f, cancelable = true)
+  def flatMap[B](f: A => IO[B]): IO[B] = IO.FlatMap(this, f, continual = false)
   def flatten[B](implicit ev: A <:< IO[B]): IO[B] = flatMap(ev)
 
-  def continual[B](f: Either[Throwable, A] => IO[B]): IO[B] = IO.FlatMap(this.attempt, f, cancelable = false)
+  def continual[B](
+    f: Either[Throwable, A] => IO[B]
+  ): IO[B] = /* todo implement with mask */ IO.FlatMap(this.attempt, f, continual = true)
   def map[B](f: A => B): IO[B] = flatMap(f.andThen(IO.pure))
   def as[B](b: => B): IO[B] = map(_ => b)
   def void: IO[Unit] = this *> IO.unit
@@ -60,7 +71,8 @@ object IO {
   final case class Fork[A](self: IO[A]) extends IO[Fiber[A]]
   final case class Async[A](cb: (Either[Throwable, A] => Unit) => Unit) extends IO[A]
   final case class On[A](ec: ExecutionContext, underlying: IO[A]) extends IO[A]
-  final case class FlatMap[A, B](ioa: IO[A], f: A => IO[B], cancelable: Boolean) extends IO[B]
+  final case class FlatMap[A, B](ioa: IO[A], f: A => IO[B], continual: Boolean) extends IO[B]
+  final case object Canceled extends IO[Nothing]
   final case object Blocker extends IO[ExecutionContext]
   final case object Executor extends IO[ExecutionContext]
   final case object Scheduler extends IO[ScheduledExecutorService]
@@ -68,12 +80,14 @@ object IO {
 
   def apply[A](a: => A): IO[A] = delay(a)
 
+  val canceled: IO[Nothing] = IO.Canceled
   val unit: IO[Unit] = IO.pure(())
   def pure[A](a: A): IO[A] = Pure(a)
   def delay[A](a: => A): IO[A] = Delay(() => a)
   def suspend[A](a: => IO[A]): IO[A] = delay(a).flatten
   def raiseError(e: Throwable): IO[Nothing] = RaiseError(e)
   def fromEither[A](ea: Either[Throwable, A]): IO[A] = ea.fold(raiseError, pure)
+  def fromExit[A](exit: Exit[A]): IO[A] = exit.fold(pure, raiseError, canceled)
 
   def async[A](cb: (Either[Throwable, A] => Unit) => Unit): IO[A] = Async(cb)
   val never: IO[Nothing] = async(_ => ())
@@ -116,10 +130,7 @@ object IO {
   def unsafeRun[A](ioa: IO[A])(runtime: Runtime): Fiber[A] = {
     val promise = Promise[Exit[A]]()
 
-    val fiberId = unsafeRunAsync(ioa) {
-      case Left(e)  => promise.success(Exit.Failed(e))
-      case Right(a) => promise.success(Exit.Succeeded(a))
-    }(runtime)
+    val fiberId = unsafeRunAsync(ioa)(promise.success)(runtime)
 
     new Fiber[A] {
       def join: IO[Exit[A]] = IO.fromFuture(IO.pure(promise.future))
@@ -128,38 +139,47 @@ object IO {
     }
   }
 
-  def unsafeRunAsync[A](ioa: IO[A])(cb: Either[Throwable, A] => Unit)(runtime: Runtime): FiberId = {
-    def doRun[B](iob: IO[B])(cb: Either[Throwable, B] => Unit)(ctx: Context): Unit = {
-      def continue(value: B) = cb(Right(value))
+  def unsafeRunAsync[A](ioa: IO[A])(cb: Exit[A] => Unit)(runtime: Runtime): FiberId = {
+    def doRun[B](iob: IO[B])(cb: Exit[B] => Unit)(ctx: Context): Unit = {
+      def continue(value: B) = cb(Exit.Succeeded(value))
 
       iob match {
-        //sync programs
-        case Pure(a) => continue(a)
+        //end states
+        case Pure(a)       => continue(a)
+        case Canceled      => cb(Exit.Canceled)
+        case RaiseError(e) => cb(Exit.Failed(e))
+
+        //sync FFI
         case Delay(f) =>
           try continue(f())
-          catch { case NonFatal(e) => cb(Left(e)) }
-
-        case RaiseError(e) => cb(Left(e))
+          catch { case NonFatal(e) => cb(Exit.Failed(e)) }
 
         //context/runtime values
-        case Executor    => continue(ctx.ec)
-        case Identifier  => continue(ctx.id)
-        case Blocker     => continue(runtime.blocker)
-        case Scheduler   => continue(runtime.scheduler)
-        case Attempt(io) => doRun(io)(continue)(ctx)
+        case Executor   => continue(ctx.ec)
+        case Identifier => continue(ctx.id)
+        case Blocker    => continue(runtime.blocker)
+        case Scheduler  => continue(runtime.scheduler)
+        case a: Attempt[b] =>
+          doRun(a.self) {
+            case Exit.Succeeded(r) => continue(Right(r))
+            case Exit.Failed(e)    => continue(Left(e))
+            case Exit.Canceled     => throw new Exception("cancelation isn't supported yet")
+          }(ctx)
 
-        case Fork(self) => cb(Right(unsafeRun(self)(runtime)))
+        case Fork(self) => cb(Exit.Succeeded(unsafeRun(self)(runtime)))
         case Async(f) =>
           f { asyncResult =>
             //todo this must check for an idempotency flag
-            ctx.ec.execute(() => cb(asyncResult))
+            ctx.ec.execute(() => cb(Exit.fromEither(asyncResult)))
           }
         case On(ec, io) =>
           ec.execute(() => doRun(io)(result => ctx.ec.execute(() => cb(result)))(ctx.withExecutor(ec)))
         case next: FlatMap[a, b] =>
+          //stack safety? lmaooo
           doRun(next.ioa) {
-            case Left(e)  => cb(Left(e))
-            case Right(v) => doRun(next.f(v))(cb)(ctx)
+            case Exit.Succeeded(v)  => doRun(next.f(v))(cb)(ctx)
+            case e @ Exit.Failed(_) => cb(e)
+            case Exit.Canceled      => throw new Exception("cancelation isn't supported yet")
           }(ctx)
 
       }
@@ -171,9 +191,9 @@ object IO {
     rootContext.id
   }
 
-  def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): Either[Throwable, A] = {
+  def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): Exit[A] = {
     val latch = new CountDownLatch(1)
-    var value: Option[Either[Throwable, A]] = None
+    var value: Option[Exit[A]] = None
 
     IO.unsafeRunAsync(prog) { v =>
       value = Some(v)
