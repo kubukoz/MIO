@@ -16,6 +16,7 @@ import cats.MonadError
 import cats.StackSafeMonad
 import cats.implicits._
 import scala.util.Random
+import java.util.concurrent.atomic.AtomicBoolean
 
 sealed trait Exit[+A] extends Product with Serializable {
 
@@ -129,19 +130,21 @@ object IO {
   private val globalFiberId = new AtomicLong(0)
   private def newFiberId() = FiberId("Fiber-" + globalFiberId.getAndIncrement())
 
-  def unsafeRun[A](ioa: IO[A])(runtime: Runtime): Fiber[A] = {
+  private def unsafeRun[A](ioa: IO[A])(runtime: Runtime): Fiber[A] = {
     val promise = Promise[Exit[A]]()
 
-    val fiberId = unsafeRunAsync(ioa)(promise.success)(runtime)
+    val (fiberId, cancelFiber) = unsafeRunAsync(ioa)(promise.success)(runtime)
 
     new Fiber[A] {
-      def join: IO[Exit[A]] = IO.fromFuture(IO.pure(promise.future))
-      def cancel: IO[Unit] = IO.raiseError(new Throwable("cancel isn't implemented yet"))
-      def id: FiberId = fiberId
+      val join: IO[Exit[A]] = IO.fromFuture(IO.pure(promise.future))
+      val cancel: IO[Unit] = cancelFiber
+      val id: FiberId = fiberId
     }
   }
 
-  def unsafeRunAsync[A](ioa: IO[A])(cb: Exit[A] => Unit)(runtime: Runtime): FiberId = {
+  def unsafeRunAsync[A](ioa: IO[A])(cb: Exit[A] => Unit)(runtime: Runtime): (FiberId, IO[Unit]) = {
+    val canceled = new AtomicBoolean(false)
+
     def doRun[B](iob: IO[B])(cb: Exit[B] => Unit)(ctx: Context): Unit = {
       def continue(value: B) = cb(Exit.Succeeded(value))
 
@@ -195,47 +198,84 @@ object IO {
     val rootContext = Context(runtime.ec, newFiberId())
 
     runtime.ec.execute(() => doRun(ioa)(cb)(rootContext))
-    rootContext.id
+
+    /* todo the second IO must wait for finalizers to finish */
+    (rootContext.id, IO(canceled.set(true)))
   }
 
-  def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): Exit[A] = {
+  def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): (() => Exit[A], IO[Unit]) = {
     val latch = new CountDownLatch(1)
     var value: Option[Exit[A]] = None
 
-    IO.unsafeRunAsync(prog) { v =>
+    val (_, finalizers) = IO.unsafeRunAsync(prog) { v =>
       value = Some(v)
       latch.countDown()
     }(runtime)
 
-    latch.await()
-    value.get
+    val await = () => {
+      latch.await()
+      value.get
+    }
+
+    (await, finalizers)
   }
 
   final case class Runtime(ec: ExecutionContext, scheduler: ScheduledExecutorService, blocker: ExecutionContext)
 
-  final case class Context(ec: ExecutionContext, id: FiberId) {
+  final private case class Context(ec: ExecutionContext, id: FiberId) {
     def withExecutor(ec: ExecutionContext) = copy(ec = ec)
   }
 }
 
-object IODemo extends App {
-  def putStrLn(s: Any): IO[Unit] = IO(println(s))
+trait IOApp {
 
-  def printThread(tag: String) = IO.suspend(putStrLn(tag + ": " + Thread.currentThread().getName()))
-
-  val blocker = ExecutionContext.fromExecutorService(Executors.newCachedThreadPool(prefixFactory("blocker")))
-
-  def prefixFactory(prefix: String) =
+  //internals
+  def unsafePrefixFactory(prefix: String) =
     new ThreadFactory {
       val a = new AtomicInteger(1)
       def newThread(r: Runnable): Thread = new Thread(r, s"$prefix-thread-${a.getAndIncrement()}")
     }
 
-  val newEc = ExecutionContext.fromExecutorService(Executors.newSingleThreadExecutor(prefixFactory("newEc")))
+  private val blocker =
+    ExecutionContext.fromExecutorService(Executors.newCachedThreadPool(unsafePrefixFactory("blocker")))
+  private val scheduler = new ScheduledThreadPoolExecutor(1)
+  private val runtime = IO.Runtime(ExecutionContext.global, scheduler, blocker)
 
-  val ses = new ScheduledThreadPoolExecutor(1)
+  //////////////
+  def run(args: List[String]): IO[Int]
 
-  val runtime = IO.Runtime(ExecutionContext.global, ses, blocker)
+  //todo install shutdown hooks etc
+  def main(args: Array[String]): Unit = {
+    def reportError(e: Throwable) = {
+      new Throwable("IOApp#run failed", e).printStackTrace()
+      1
+    }
+
+    val code =
+      try {
+        val (awaitExit, finalizers) = IO.unsafeRunSync(run(args.toList))(runtime)
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() => {
+          val _ = IO.unsafeRunSync(finalizers)(runtime)
+        }))
+
+        awaitExit().fold(identity, reportError, 0)
+      } finally {
+        scheduler.shutdown()
+        blocker.shutdown()
+      }
+
+    System.exit(code)
+  }
+}
+
+object IODemo extends IOApp {
+
+  val newEc = ExecutionContext.fromExecutorService(Executors.newSingleThreadExecutor(unsafePrefixFactory("newEc")))
+
+  def putStrLn(s: Any): IO[Unit] = IO(println(s))
+
+  def printThread(tag: String) = IO.suspend(putStrLn(tag + ": " + Thread.currentThread().getName()))
 
   val prog =
     for {
@@ -251,16 +291,16 @@ object IODemo extends App {
 
       prog = IO.sleep(500L, TimeUnit.MILLISECONDS) *> IO.fiberId.flatMap(putStrLn) *> IO
         .flipCoin
-        .ifM(IO.pure(42), IO.raiseError(new Throwable("failed coin flip :/")))
+        .ifM(IO.fiberId, IO.raiseError(new Throwable("failed coin flip :/")))
       _ <- List.fill(10)(prog).traverse(_.fork).flatMap(_.traverse(_.join)).flatMap(putStrLn(_))
       _ <- printThread("after sleeps")
     } yield 42
 
-  println {
-    IO.unsafeRunSync(printThread("before evalOn") *> prog.evalOn(newEc) <* printThread("after evalOn"))(runtime)
-  }
+  def run(args: List[String]): IO[Int] = {
+    printThread("before evalOn") *> prog.evalOn(newEc) <* printThread("after evalOn")
+  } <*
+    //this should be in `guarantee`, or better, in a Resource
+    //but we don't have bracket yet ;)
+    IO(newEc.shutdown())
 
-  ses.shutdown()
-  newEc.shutdown()
-  blocker.shutdown()
 }
