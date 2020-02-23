@@ -19,6 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import cats.~>
 import cats.effect.ExitCase
 import cats.effect.Resource
+import java.util.concurrent.atomic.AtomicReference
+import scala.concurrent.duration._
 
 sealed trait Exit[+A] extends Product with Serializable {
 
@@ -39,14 +41,19 @@ object Exit {
 
 final case class Fiber[+A](id: FiberId, join: IO[Exit[A]], cancel: IO[Unit])
 
-final case class FiberId(id: String)
+final case class FiberId(id: Long)
 
 sealed trait IO[+A] extends Serializable {
   def flatMap[B](f: A => IO[B]): IO[B] = IO.FlatMap(this, f)
   def attempt: IO[Either[Throwable, A]] = IO.Attempt(this)
   def evalOn(ec: ExecutionContext): IO[A] = IO.On(ec, this)
+
+  //Forking is uncancelable.
   def fork: IO[Fiber[A]] = IO.Fork(this)
   def exit: IO[Exit[A]] = IO.ExitOf(this)
+
+  def onCancel(cleanup: IO[Unit]): IO[A] =
+    bracketExit(_.pure[IO])((_, e) => e.fold(_ => IO.unit, _ => IO.unit, cleanup))
 
   def bracket[B](use: A => IO[B])(cleanup: A => IO[Unit]): IO[B] = bracketExit(use)((a, _) => cleanup(a))
 
@@ -132,15 +139,14 @@ object IO {
 
   val flipCoin: IO[Boolean] = IO(Random.nextBoolean())
 
-  def sleep(units: Long, unit: TimeUnit): IO[Unit] =
+  def sleep(duration: FiniteDuration): IO[Unit] =
     IO.scheduler.flatMap { ses =>
       IO.async[Unit] { cb =>
-        val scheduling = ses.schedule((() => cb(Right(()))): Runnable, units, unit)
+        val scheduling = ses.schedule((() => cb(Right(()))): Runnable, duration.length, duration.unit)
 
         //todo should it be false?
         IO(println("exiting sleep")) *>
           IO(scheduling.cancel(false)) *>
-          IO.sleep(1, TimeUnit.SECONDS) *>
           IO(println("exited sleep"))
       }
     }
@@ -167,7 +173,7 @@ object IO {
   }
 
   private val globalFiberId = new AtomicLong(0)
-  private def newFiberId() = FiberId("Fiber-" + globalFiberId.getAndIncrement())
+  private def newFiberId() = FiberId(globalFiberId.getAndIncrement())
 
   private def unsafeRun[A](ioa: IO[A])(runtime: Runtime): Fiber[A] = {
     val promise = Promise[Exit[A]]()
@@ -179,19 +185,23 @@ object IO {
     Fiber(fiberId, join, cancelFiber)
   }
 
-  // //thread safe
-  // private class FinalizerStack(var stack: AtomicReference[List[IO[Unit]]]) {
+  //thread safe, mutable
+  private class FinalizerStack(var stack: AtomicReference[List[IO[Unit]]]) {
 
-  //   def push(finalizer: IO[Unit]): Unit = { val _ = stack.updateAndGet(finalizer :: _) }
+    def push(finalizer: IO[Unit]): Unit = { val _ = stack.updateAndGet(finalizer :: _) }
 
-  //   def popAll(): List[IO[Unit]] = stack.getAndSet(Nil).reverse
-  // }
+    def popAll(): List[IO[Unit]] = stack.getAndSet(Nil).reverse
+  }
+
+  private object FinalizerStack {
+    def initial(): FinalizerStack = new FinalizerStack(new AtomicReference(Nil))
+  }
 
   def unsafeRunAsync[A](ioa: IO[A])(cb: Exit[A] => Unit)(runtime: Runtime): (FiberId, IO[Unit]) = {
-    // val canceled = new AtomicBoolean(false)
+    val canceled = new AtomicBoolean(false)
 
     //must be thread safe
-    // val finalizers: FinalizerStack = new FinalizerStack(new AtomicReference(Nil))
+    val finalizers: FinalizerStack = FinalizerStack.initial()
 
     def doRun[B](iob: IO[B])(cb: Exit[B] => Unit)(ctx: Context): Unit = {
       def continue(value: B) = cb(Exit.Succeeded(value))
@@ -223,7 +233,15 @@ object IO {
         case WithCancelability(block, newCancelable) => doRun(block)(cb)(ctx.withCancelability(newCancelable))
         case AskCancelability(ask)                   => doRun(ask(ctx.cancelable))(cb)(ctx)
 
-        case Yield => ctx.ec.execute(() => continue(()))
+        case Yield =>
+          ctx
+            .ec
+            .execute(() =>
+              if (ctx.cancelable && canceled.get())
+                cb(Exit.Canceled)
+              else
+                continue(())
+            )
 
         case Fork(self) =>
           val child = unsafeRun(self)(runtime)
@@ -235,28 +253,47 @@ object IO {
         case Async(f) =>
           val callbackCalled = new AtomicBoolean(false)
 
-          val finalizer = f { asyncResult =>
+          val finalizer: IO[Unit] = f { asyncResult =>
             //checking idempotency flag - if this is already true, don't do anything
             if (!callbackCalled.getAndSet(true)) {
-              ctx.ec.execute { () =>
-                // if (!canceled.get())(
-                cb(Exit.fromEither(asyncResult))
-                // )
-              }
+              finalizers.popAll() //popping and ignoring finalizers - they would've ran only on cancel
+
+              ctx.ec.execute(() => cb(Exit.fromEither(asyncResult)))
             }
           }
-          val _ = finalizer
-        /*
-          //if the callback has been called already, cancel must no-op
-          finalizers.push {
-            IO(callbackCalled.get()).flatMap {
-              case true  => IO.unit
-              case false => finalizer *> IO(cb(Exit.Canceled))
+
+          val fullFinalizer =
+            IO(callbackCalled.getAndSet(true)).ifM(
+              ifFalse = finalizer *> IO(ctx.ec.execute(() => cb(Exit.Canceled))),
+              ifTrue = IO.unit
+            )
+
+          if (ctx.cancelable) {
+            //This happens if the async call is canceled before the current node,
+            //As async tasks check for cancelation after async boundaries (not before), the task has already started - so we immediately cancel it in a new fiber.
+            if (canceled.get()) {
+              doRun(fullFinalizer.fork)(_ => () /* report failures */ )(ctx)
+            } else {
+              finalizers.push(fullFinalizer)
             }
           }
-         */
+
         case On(ec, io) =>
-          ec.execute(() => doRun(io)(result => ctx.ec.execute(() => cb(result)))(ctx.withExecutor(ec)))
+          def afterwards(result: Exit[B]) = ctx.ec.execute { () =>
+            //checking cancelation after shifting back
+            if (ctx.cancelable && canceled.get())
+              cb(Exit.Canceled)
+            else
+              cb(result)
+          }
+
+          ec.execute { () =>
+            //checking cancelation after shifting to new pool
+            if (ctx.cancelable && canceled.get())
+              cb(Exit.Canceled)
+            else
+              doRun(io)(afterwards)(ctx.withExecutor(ec))
+          }
 
         case next: FlatMap[a, b] =>
           //stack safety? lmaooo
@@ -274,8 +311,12 @@ object IO {
     //Always yield before starting
     doRun(IO.cede *> ioa)(cb)(rootContext)
 
-    //cancel is no-op for now
-    (rootContext.id, IO.unit)
+    val awaitFinalizers = IO(finalizers.popAll()).flatMap(_.sequence_)
+
+    val cancel =
+      IO(canceled.getAndSet(true)) >>= awaitFinalizers.unlessA
+
+    (rootContext.id, cancel)
   }
 
   //returns: synchronous join, IO with finalizers
@@ -368,7 +409,7 @@ object IODemo extends IOApp {
     for {
       _ <- printThread("foo")
       _ <- IO.blocking(
-            printThread("blocking") *> IO.sleep(10L, TimeUnit.MILLISECONDS) *> printThread(
+            printThread("blocking") *> IO.sleep(10.millis) *> printThread(
               "after sleep but in blocking"
             )
           )
@@ -376,7 +417,7 @@ object IODemo extends IOApp {
       _ <- printFiber("prog")
       _ <- printThread("before sleep")
 
-      prog = IO.sleep(500L, TimeUnit.MILLISECONDS) *>
+      prog = IO.sleep(500.millis) *>
         IO.fiberId.flatMap(putStrLn) *>
         IO.flipCoin.ifM(IO.fiberId, IO.raiseError(new Throwable("failed coin flip :/")))
       _ <- List.fill(5)(prog).traverse(_.fork).flatMap(_.traverse(_.join)).flatMap(putStrLn(_))
@@ -384,11 +425,10 @@ object IODemo extends IOApp {
     } yield 42
 
   def run(args: List[String]): IO[Int] =
-    (putStrLn("Starting") *> IO.sleep(2, TimeUnit.SECONDS) *> putStrLn("completed!"))
+    (putStrLn("Started") *> IO.sleep(2.seconds) *> putStrLn("completed!"))
       .fork
-      .flatMap(fib => IO.sleep(500, TimeUnit.MILLISECONDS) *> fib.cancel *> fib.join.flatMap(putStrLn(_)))
+      .flatMap(fib => fib.cancel *> fib.join.flatMap(putStrLn(_)))
       .as(0)
-
   /* newEcResource.use { newEc =>
     printThread("before evalOn") *> prog.evalOn(newEc) <* printThread("after evalOn")
   } */
