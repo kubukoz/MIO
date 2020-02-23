@@ -314,7 +314,7 @@ object IO {
     val cancel =
       IO(canceled.getAndSet(true)) >>= awaitFinalizers.unlessA
 
-    (rootContext.id, cancel)
+    (rootContext.id, cancel.uncancelable)
   }
 
   //returns: synchronous join, IO with finalizers
