@@ -262,7 +262,7 @@ object IO {
               ctx.ec.execute(() => cb(Exit.fromEither(asyncResult)))
             }
 
-          //This will register the callback and finalizers, or (ifthe context wa)
+          //This will register the callback and finalizers
           val register = f(callback)
             .map { finalizer =>
               IO(callbackCalled.getAndSet(true)).ifM(
