@@ -73,7 +73,7 @@ object IO {
   final private case class Delay[A](f: () => A) extends IO[A]
   final private case class Fork[A](self: IO[A]) extends IO[Fiber[A]]
   final private case object Yield extends IO[Unit]
-  final private case class Async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]) extends IO[A]
+  final private case class Async[A](cb: (Either[Throwable, A] => Unit) => IO[IO[Unit]]) extends IO[A]
   final private case class On[A](ec: ExecutionContext, underlying: IO[A]) extends IO[A]
   final private case class FlatMap[A, B](ioa: IO[A], f: A => IO[B]) extends IO[B]
   final private case class AskCancelability[A](ioa: Boolean => IO[A]) extends IO[A]
@@ -115,16 +115,19 @@ object IO {
 
   //Provide the curent cancelability status to a block. There's no cancelation possible between checking the status and starting the action in `f`.
   def askCancelability[A](f: Boolean => IO[A]): IO[A] = AskCancelability(f)
-  def async[A](cb: (Either[Throwable, A] => Unit) => IO[Unit]): IO[A] = Async(cb)
-  val never: IO[Nothing] = async(_ => IO.unit)
+  //outer effect registers the callback, inner effect cancels
+  def async[A](cb: (Either[Throwable, A] => Unit) => IO[IO[Unit]]): IO[A] = Async(cb)
+  val never: IO[Nothing] = async(_ => IO.pure(IO.unit))
   val cede: IO[Unit] = Yield
 
   def fromFuture[A](futurea: IO[Future[A]]): IO[A] = futurea.flatMap { future =>
     future.value match {
       case None =>
         IO.async[A] { cb =>
-          future.onComplete(cb.compose(_.toEither))(ExecutionContext.parasitic)
-          IO.unit
+          IO {
+            future.onComplete(cb.compose(_.toEither))(ExecutionContext.parasitic)
+            IO.unit
+          }
         }
       case Some(t) => fromEither(t.toEither)
     }
@@ -142,12 +145,12 @@ object IO {
   def sleep(duration: FiniteDuration): IO[Unit] =
     IO.scheduler.flatMap { ses =>
       IO.async[Unit] { cb =>
-        val scheduling = ses.schedule((() => cb(Right(()))): Runnable, duration.length, duration.unit)
-
-        //todo should it be false?
-        IO(println("exiting sleep")) *>
-          IO(scheduling.cancel(false)) *>
-          IO(println("exited sleep"))
+        IO {
+          ses.schedule((() => cb(Right(()))): Runnable, duration.length, duration.unit)
+        }.map { scheduling =>
+          //todo should it be false?
+          IO(scheduling.cancel(false)).void
+        }
       }
     }
 
@@ -169,7 +172,7 @@ object IO {
 
     def suspend[A](thunk: => IO[A]): IO[A] = IO.suspend(thunk)
     def async[A](k: (Either[Throwable, A] => Unit) => Unit): IO[A] = asyncF { cb => k(cb); unit }
-    def asyncF[A](k: (Either[Throwable, A] => Unit) => IO[Unit]): IO[A] = IO.async(k)
+    def asyncF[A](k: (Either[Throwable, A] => Unit) => IO[Unit]): IO[A] = IO.async(k(_).as(IO.unit))
   }
 
   private val globalFiberId = new AtomicLong(0)
@@ -251,30 +254,37 @@ object IO {
         case Async(f) =>
           val callbackCalled = new AtomicBoolean(false)
 
-          val finalizer: IO[Unit] = f { asyncResult =>
+          val callback: Either[Throwable, B] => Unit = asyncResult =>
             //checking idempotency flag - if this is already true, don't do anything
             if (!callbackCalled.getAndSet(true)) {
               finalizers.popAll() //popping and ignoring finalizers - they would've ran only on cancel
 
               ctx.ec.execute(() => cb(Exit.fromEither(asyncResult)))
             }
-          }
 
-          val fullFinalizer =
-            IO(callbackCalled.getAndSet(true)).ifM(
-              ifFalse = finalizer *> IO(ctx.ec.execute(() => cb(Exit.Canceled))),
-              ifTrue = IO.unit
-            )
-
-          if (ctx.cancelable) {
-            //This happens if the async call is canceled before the current node starts,
-            //As async tasks check for cancelation after async boundaries (not before), the task has already started - so we immediately cancel it in a new fiber.
-            if (canceled.get()) {
-              doRun(fullFinalizer.fork)(_ => () /* report failures */ )(ctx)
-            } else {
-              finalizers.push(fullFinalizer)
+          //This will register the callback and finalizers, or (ifthe context wa)
+          val register = f(callback)
+            .map { finalizer =>
+              IO(callbackCalled.getAndSet(true)).ifM(
+                ifFalse = finalizer *> IO(ctx.ec.execute(() => cb(Exit.Canceled))),
+                ifTrue = IO.unit
+              )
             }
-          }
+            .flatMap { finalizer =>
+              IO.AskCancelability {
+                case true =>
+                  //This happens if the async call is canceled before the async node is interpreted.
+                  //As async tasks check for cancelation after async boundaries (not before), so if the task has already started - we immediately cancel it.
+                  if (canceled.get()) {
+                    finalizer
+                  } else {
+                    IO(finalizers.push(finalizer))
+                  }
+                case false => IO.unit
+              }
+            }
+
+          doRun(register)(_ => /* todo: report registration/finalizer errors */ ())(ctx)
 
         case On(ec, io) =>
           def afterwards(result: Exit[B]) = ctx.ec.execute { () =>
@@ -317,8 +327,8 @@ object IO {
     (rootContext.id, cancel.uncancelable)
   }
 
-  //returns: synchronous join, IO with finalizers
-  def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): (() => Exit[A], IO[Unit]) = {
+  //returns: blocking join, blocking finalizers
+  def unsafeRunSync[A](prog: IO[A])(runtime: Runtime): (() => Exit[A], () => Unit) = {
     val latch = new CountDownLatch(1)
     var value: Option[Exit[A]] = None
 
@@ -327,12 +337,20 @@ object IO {
       latch.countDown()
     }(runtime)
 
-    val await = () => {
+    val awaitResult = () => {
       latch.await()
       value.get
     }
 
-    (await, finalizers)
+    val runFinalizers = () => {
+      val (await, _) = unsafeRunSync(finalizers)(runtime)
+      val _ = await()
+
+      //Wait for program exit
+      val _ = awaitResult()
+    }
+
+    (awaitResult, runFinalizers)
   }
 
   final case class Runtime(ec: ExecutionContext, scheduler: ScheduledExecutorService, blocker: ExecutionContext)
@@ -370,18 +388,12 @@ trait IOApp {
       try {
         val (awaitExit, finalizers) = IO.unsafeRunSync(run(args.toList))(runtime)
 
-        // val hook = new Thread(() => {
-        //   val _ = IO.unsafeRunSync(finalizers)(runtime)
-        //   // val _ = run //scalafmt couldn't parse this
-        //   ()
-        // })
+        val hook = new Thread(() => finalizers())
 
-        // Runtime.getRuntime().addShutdownHook(hook)
+        Runtime.getRuntime().addShutdownHook(hook)
 
         // //probably not the best way to do it, but...
-        // awaitExit().fold(a => { Runtime.getRuntime().removeShutdownHook(hook); a }, reportError, 0)
-        awaitExit()
-        0
+        awaitExit().fold(identity, reportError, 0)
       } finally {
         try scheduler.shutdown()
         finally blocker.shutdown()
@@ -424,4 +436,10 @@ object IODemo extends IOApp {
     newEcResource.use(newEc =>
       printThread("before evalOn: global") *> prog.evalOn(newEc) <* printThread("after evalOn: global")
     )
+  // IO.blocking(IO(Thread.sleep(5000)))
+  //   .onCancel(putStrLn("oh noes"))
+  //   .fork
+  //   .flatMap(fib => fib.cancel *> fib.join)
+  //   .flatMap(putStrLn)
+  //   .as(0)
 }

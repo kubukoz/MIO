@@ -39,4 +39,4 @@ val commonSettings = Seq(
 )
 
 val mio =
-  project.in(file(".")).settings(commonSettings)
+  project.in(file(".")).settings(commonSettings).enablePlugins(JavaAppPackaging).enablePlugins(GraalVMNativeImagePlugin)
