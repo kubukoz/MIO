@@ -63,7 +63,7 @@ sealed trait IO[+A] extends Serializable {
 
   def continual[B](f: Either[Throwable, A] => IO[B]): IO[B] = IO.mask(_(attempt).flatMap(f))
 
-  def uncancelable: IO[A] = bracket(_.pure[IO])(_ => IO.unit)
+  def uncancelable: IO[A] = IO.mask(_ => this)
 }
 
 object IO {
@@ -433,9 +433,19 @@ object IODemo extends IOApp {
     } yield 42
 
   def run(args: List[String]): IO[Int] =
-    newEcResource.use(newEc =>
-      printThread("before evalOn: global") *> prog.evalOn(newEc) <* printThread("after evalOn: global")
-    )
+    // newEcResource.use(newEc =>
+    //   printThread("before evalOn: global") *> prog.evalOn(newEc) <* printThread("after evalOn: global")
+    // )
+    IO.sleep(2.seconds)
+      .bracketExit(_ => IO.mask(restore => putStrLn("before sleep") *> IO.never *> putStrLn("after sleep")))((_, e) =>
+        putStrLn("exited with " + e)
+      )
+      .fork
+      .flatMap(fib =>
+        IO.sleep(500.millis) *> putStrLn("about to cancel") *> fib.cancel *> putStrLn("cancel finished") *> fib.join
+      )
+      .flatMap(a => putStrLn("final result: " + a))
+      .as(0)
   // IO.blocking(IO(Thread.sleep(5000)))
   //   .onCancel(putStrLn("oh noes"))
   //   .fork
