@@ -234,14 +234,12 @@ object IO {
         case AskCancelability(ask)                   => doRun(ask(ctx.cancelable))(cb)(ctx)
 
         case Yield =>
-          ctx
-            .ec
-            .execute(() =>
-              if (ctx.cancelable && canceled.get())
-                cb(Exit.Canceled)
-              else
-                continue(())
-            )
+          ctx.ec.execute { () =>
+            if (ctx.cancelable && canceled.get())
+              cb(Exit.Canceled)
+            else
+              continue(())
+          }
 
         case Fork(self) =>
           val child = unsafeRun(self)(runtime)
@@ -269,7 +267,7 @@ object IO {
             )
 
           if (ctx.cancelable) {
-            //This happens if the async call is canceled before the current node,
+            //This happens if the async call is canceled before the current node starts,
             //As async tasks check for cancelation after async boundaries (not before), the task has already started - so we immediately cancel it in a new fiber.
             if (canceled.get()) {
               doRun(fullFinalizer.fork)(_ => () /* report failures */ )(ctx)
@@ -407,29 +405,23 @@ object IODemo extends IOApp {
 
   val prog =
     for {
-      _ <- printThread("foo")
+      _ <- printThread("newEc")
       _ <- IO.blocking(
-            printThread("blocking") *> IO.sleep(10.millis) *> printThread(
+            printThread("blocking") *> IO
+              .sleep(10.millis) *> IO.raiseError(new Throwable("oops")).attempt *> printThread(
               "after sleep but in blocking"
             )
           )
-      _ <- printThread("bar")
-      _ <- printFiber("prog")
-      _ <- printThread("before sleep")
-
+      _ <- printThread("newEc")
       prog = IO.sleep(500.millis) *>
         IO.fiberId.flatMap(putStrLn) *>
-        IO.flipCoin.ifM(IO.fiberId, IO.raiseError(new Throwable("failed coin flip :/")))
+        IO.flipCoin.ifM(printThread("flip") *> IO.fiberId, IO.raiseError(new Throwable("failed coin flip :/")))
       _ <- List.fill(5)(prog).traverse(_.fork).flatMap(_.traverse(_.join)).flatMap(putStrLn(_))
-      _ <- printThread("after sleeps")
+      _ <- printThread("newEc")
     } yield 42
 
   def run(args: List[String]): IO[Int] =
-    (putStrLn("Started") *> IO.sleep(2.seconds) *> putStrLn("completed!"))
-      .fork
-      .flatMap(fib => fib.cancel *> fib.join.flatMap(putStrLn(_)))
-      .as(0)
-  /* newEcResource.use { newEc =>
-    printThread("before evalOn") *> prog.evalOn(newEc) <* printThread("after evalOn")
-  } */
+    newEcResource.use(newEc =>
+      printThread("before evalOn: global") *> prog.evalOn(newEc) <* printThread("after evalOn: global")
+    )
 }
