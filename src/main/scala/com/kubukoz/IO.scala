@@ -1,12 +1,12 @@
-import cats.syntax.flatMap._
+import cats.syntax.functor._
 import scala.language.implicitConversions
 
 trait IO[A] {
 
   def bracketExit[B]: IO[B] =
-    this.flatMap(_ => (??? : IO[B]))
+    this.map(a => (???): B)
 }
 
 object IO {
-  implicit val ioFlatmap: cats.FlatMap[IO] = ???
+  implicit def ioFunctor[A]: cats.Functor[IO] = ???
 }
